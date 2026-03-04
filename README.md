@@ -1,12 +1,12 @@
 # OCI Snapshot Scanning Platform
 
-A fully OCI-native snapshot scanning platform that enables centralized vulnerability, software composition, and secret scanning across multiple OCI tenancies. This is the OCI equivalent of an AWS-based snapshot scanning system, rebuilt from the ground up to leverage OCI's native services and cross-tenancy federation model.
+A fully OCI-native snapshot scanning platform that enables centralized vulnerability, software composition, and secret scanning across multiple OCI tenancies. Built from the ground up to leverage OCI's native services and cross-tenancy federation model.
 
 ## Why This Exists
 
 Cloud security scanning at scale requires inspecting the actual contents of compute volumes, not just API metadata. This platform creates temporary backups of volumes across your OCI estate, mounts them to ephemeral scanner instances, runs deep scans (vulnerability, SWCA, secrets), and reports results back to a central orchestrator. All without installing agents on production workloads.
 
-The challenge in OCI is that tenancy boundaries are hard boundaries. Unlike AWS where cross-account roles are straightforward, OCI requires endorse/admit policy pairs at root compartment level. This platform handles that complexity so scanning teams can operate across organizational tenancies seamlessly.
+The challenge in OCI is that tenancy boundaries are hard boundaries. Cross-tenancy access requires endorse/admit policy pairs at root compartment level, and there is no direct snapshot sharing between tenancies. This platform handles that complexity so scanning teams can operate across organizational tenancies seamlessly.
 
 ## Architecture Overview
 

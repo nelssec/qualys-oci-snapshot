@@ -1,6 +1,6 @@
 # Building an OCI-Native Cross-Tenancy Snapshot Scanning Platform
 
-**How we built a serverless, queue-driven scanning engine that federates across OCI tenancy boundaries to perform agentless volume-level security scanning at scale.**
+**How we built a serverless, queue-driven scanning engine that federates across OCI tenancy boundaries to perform agentless volume-level security scanning at scale -- and why the existing approaches fall short.**
 
 ---
 
@@ -8,15 +8,74 @@
 
 You have hundreds of compute instances spread across multiple OCI tenancies. You need to scan their volumes for vulnerabilities, software composition issues, and secrets. You can't install agents on production workloads. And you need to do it without storing a single credential in your codebase.
 
-This is the snapshot scanning problem, and solving it in OCI required us to rethink everything from the ground up.
+This is the snapshot scanning problem. The concept is well-understood in cloud security: take a point-in-time copy of a volume, mount it to an ephemeral scanner, inspect the filesystem, report findings, clean up. Every major CNAPP vendor does some version of this on AWS and Azure. But OCI is a fundamentally different cloud with a fundamentally different tenancy model, and none of the existing approaches translate cleanly.
 
-## Why Not Just Port the AWS Version?
+So we built one from scratch, OCI-native from the ground up.
 
-We had a working AWS implementation. Cross-account IAM roles, Lambda functions, DynamoDB, SQS, the usual playbook. The naive approach would be to find the OCI equivalent of each service and swap them in. But OCI's tenancy model is fundamentally different from AWS's account model, and that difference ripples through every architectural decision.
+## Why OCI Is Different
 
-In AWS, cross-account access is a first-class primitive. You assume a role and you're operating in the target account. In OCI, tenancies are hard boundaries. Cross-tenancy access requires **endorse/admit policy pairs** at the root compartment level of both tenancies. There's no "assume role" equivalent. Your identity stays in your home tenancy, and the target tenancy's policies explicitly admit your dynamic group to perform specific operations.
+In most clouds, cross-account access follows a delegation pattern: you assume a role or service principal in the target account and operate as if you're local. Snapshots can be shared directly between accounts. The scanning vendor creates a snapshot in your account, shares it to theirs, mounts it, scans it, done.
 
-This isn't a limitation, it's actually a stronger security model. But it means your architecture has to be designed around it from the start.
+OCI doesn't work this way. Tenancies are hard boundaries. There is no "assume role" equivalent. Cross-tenancy access requires **endorse/admit policy pairs** at the root compartment level of *both* tenancies. Your identity stays in your home tenancy, and the target tenancy's policies explicitly admit your dynamic group to perform specific operations. Both sides must agree.
+
+This has profound implications for scanning architecture:
+
+- **No cross-tenancy snapshot sharing.** You can't share a volume backup between tenancies the way you share an EBS snapshot or a managed disk. You must use cross-tenancy cloning (same Availability Domain only) or backup-and-restore (same region).
+- **Root compartment policy requirement.** Cross-tenancy policies must be defined at the root compartment level, which means your organizational governance model has to account for this.
+- **Max 10 concurrent volume backups** per tenancy per region. This is an OCI platform constraint that directly affects scanning throughput.
+- **5-minute function timeout.** OCI Functions have a hard 5-minute execution limit, which rules out simple long-running scan orchestration.
+
+These aren't limitations to work around. They're constraints to design into.
+
+## How the Industry Handles OCI Today
+
+Before diving into our architecture, it's worth understanding how existing CNAPP vendors approach OCI scanning. The short answer: most don't do it well.
+
+```mermaid
+graph TB
+    subgraph "Industry Approaches to OCI Scanning"
+        direction TB
+        A[API Key + IAM User<br/>in Customer Tenancy]
+        B[In-Tenancy Scanner VMs<br/>No Cross-Tenancy]
+        C[CSPM Only<br/>No Volume Scanning]
+        D[Agent-Based<br/>Not Agentless]
+    end
+
+    subgraph "Our Approach"
+        E[Resource Principal Auth<br/>Zero Stored Credentials]
+        F[Cross-Tenancy Federation<br/>Endorse/Admit Policies]
+        G[Serverless Orchestration<br/>OCI Functions + Queues]
+    end
+
+    style A fill:#f9d,stroke:#333
+    style B fill:#f9d,stroke:#333
+    style C fill:#f9d,stroke:#333
+    style D fill:#f9d,stroke:#333
+    style E fill:#9f9,stroke:#333
+    style F fill:#9f9,stroke:#333
+    style G fill:#9f9,stroke:#333
+```
+
+**The API Key problem.** Every major vendor that does agentless scanning on OCI -- Wiz, Prisma Cloud, Orca -- requires creating a dedicated IAM user in the customer's tenancy and authenticating with API keys. This means credential management: key rotation, secure storage, risk of leaked keys. On other clouds these vendors use role-based federation. On OCI, they fall back to static credentials.
+
+**The single-tenancy problem.** Prisma Cloud explicitly does not support hub/cross-tenancy scanning mode on OCI (only AWS, Azure, and GCP). Scanning infrastructure must be deployed into every customer tenancy individually. Wiz offers their Outpost model which also runs entirely within the customer's tenancy. This means duplicated infrastructure, per-tenancy management overhead, and no centralized scanning architecture.
+
+**The CSPM-only problem.** Several vendors (CrowdStrike, Lacework/FortiCNAPP, Sysdig, Aqua) only offer control-plane scanning (CSPM/CIEM) on OCI. They can read your cloud configuration and flag misconfigurations, but they cannot inspect the actual contents of your volumes. No vulnerability scanning, no secret detection, no software composition analysis at the filesystem level.
+
+**The agent problem.** Some vendors bypass the snapshot scanning challenge entirely by requiring agents on production workloads. This works, but it's a different security model with different operational requirements, and it doesn't solve the agentless use case.
+
+| Vendor | OCI Agentless Volume Scanning | Auth Model | Cross-Tenancy | Hub/Central Mode |
+|--------|-------------------------------|------------|---------------|------------------|
+| **Wiz** | Yes (most mature) | IAM User + API Key | No (in-tenancy or Outpost) | No |
+| **Prisma Cloud** | Yes (vulns + compliance only) | IAM User + API Key | No | Explicitly unsupported |
+| **Orca** | Unclear depth | IAM User + API Key | Unknown | Unknown |
+| **CrowdStrike** | Likely CSPM-only | Unknown | Unknown | Unknown |
+| **Sysdig** | No (CSPM only) | Endorse/Admit (CSPM) | CSPM only | No |
+| **Lacework/FortiCNAPP** | No | N/A | N/A | N/A |
+| **Qualys (existing)** | No (agent-based via OCI VSS) | OCI VSS integration | N/A | N/A |
+| **This Platform** | Yes (full) | Resource Principal | Yes (endorse/admit) | Yes |
+
+The gap is clear: no one is doing OCI-native, cross-tenancy, credential-free agentless scanning. That's what we built.
 
 ## Architecture
 
@@ -88,7 +147,7 @@ graph TB
 
 ## The Cross-Tenancy Federation Model
 
-This is the foundation everything else builds on. Let's look at how it actually works.
+This is the foundation everything else builds on, and it's the single biggest differentiator from every other scanning platform on OCI. We use **zero stored credentials**.
 
 ### Identity: Dynamic Groups
 
@@ -125,7 +184,9 @@ admit dynamic-group scanner-functions of tenancy scanning to manage volume-backu
 admit dynamic-group scanner-functions of tenancy scanning to read instances in tenancy
 ```
 
-The result: functions in the scanning tenancy can call OCI APIs against target tenancies with zero stored credentials. The identity verification happens at the IAM layer, and both sides have to explicitly agree.
+The result: functions in the scanning tenancy can call OCI APIs against target tenancies with zero stored credentials. The identity verification happens at the IAM layer, and both sides have to explicitly agree. No API keys to rotate. No secrets to leak. No credentials to manage.
+
+Compare this to the industry standard of creating an IAM user, generating an API key pair, and storing the private key in a secrets manager. That works, but it's a fundamentally weaker security model with operational overhead.
 
 ## Queue-Driven Workflow Engine
 
@@ -379,7 +440,7 @@ Events are batched into discovery tasks rather than triggering individual scans.
 
 ## The qflow Orchestrator
 
-qflow is the brain. The scanning platform (this repo) provides the muscles and nervous system, but qflow decides what to scan, when, and what to do with the results.
+qflow is the brain. The scanning platform provides the muscles and nervous system, but qflow decides what to scan, when, and what to do with the results.
 
 ### What qflow needs to implement
 
@@ -418,7 +479,7 @@ This design was intentional: the scanning infrastructure should be a self-contai
 
 ## Security Deep Dive
 
-Zero stored credentials. This bears repeating because it's the single most important architectural property.
+Zero stored credentials. This bears repeating because it's the single most important architectural property -- and it's something no other OCI scanning platform achieves.
 
 ```mermaid
 graph LR
@@ -449,6 +510,8 @@ graph LR
 - **API Gateway** uses a custom authentication function that validates the `x-api-key` header against the Vault-stored token.
 
 Network isolation adds another layer: functions and scanner instances run in private subnets. Scanner instances have a dedicated NSG that restricts traffic to internal scanning operations. The only public endpoint is the API Gateway, which is authenticated.
+
+Every other vendor on OCI stores API keys in the customer tenancy. We store nothing.
 
 ## Operational Characteristics
 
@@ -481,24 +544,25 @@ Every function is idempotent. Calling `create-scan-status` twice for the same re
 ## What We Learned
 
 ### OCI's strengths for this workload
-- **Cross-tenancy federation** is more secure than AWS cross-account roles. Both sides must explicitly agree, and the policies are granular.
-- **Resource Principal auth** eliminates credential management entirely. No rotation, no secrets in config, no risk of leaked API keys.
-- **Connector Hub** is underrated. Real-time change streaming from NoSQL to functions without managing Kafka or Kinesis.
-- **Queue Service** with channel limits provides natural backpressure without custom rate limiting.
+- **Cross-tenancy federation** via endorse/admit is a genuinely stronger security model than cross-account role assumption. Both sides must explicitly agree, and the policies are granular down to individual API verbs.
+- **Resource Principal auth** eliminates credential management entirely. No rotation, no secrets in config, no risk of leaked API keys. This is something we couldn't achieve on any other cloud for cross-tenancy scanning.
+- **Connector Hub** is underrated. Real-time change streaming from NoSQL to functions without managing streaming infrastructure. Event sourcing without building event sourcing.
+- **Queue Service** with channel limits provides natural backpressure without custom rate limiting. The 10-backup OCI limit becomes a queue configuration, not application logic.
 
 ### Design patterns that paid off
-- **Decomposed functions over monolithic workflows** - each function does one thing, making debugging and updates trivial.
-- **Queues as the integration layer** - loose coupling between phases, natural error handling via DLQs, backpressure for free.
-- **NoSQL as the state store with change streams** - every state transition is durable and observable. Combined with Connector Hub, you get event sourcing without building event sourcing.
-- **Polling over long-running** - the 5-minute timeout felt like a constraint but actually led to a more resilient design. State lives in the database, not in function memory.
+- **Decomposed functions over monolithic workflows** - each function does one thing, making debugging and updates trivial. When a scan fails, you know exactly which function failed and why.
+- **Queues as the integration layer** - loose coupling between phases, natural error handling via DLQs, backpressure for free. The system self-heals because unprocessed messages just wait.
+- **NoSQL as the state store with change streams** - every state transition is durable and observable. Combined with Connector Hub, the external orchestrator has a real-time view of the entire system without any custom eventing code.
+- **Polling over long-running** - the 5-minute timeout felt like a constraint but actually led to a more resilient design. State lives in the database, not in function memory. A function crash loses nothing.
 
 ### Things to watch for
-- **Cross-tenancy policies must be at root compartment level.** This is an OCI requirement that affects your organizational governance model. Plan for it early.
+- **Cross-tenancy policies must be at root compartment level.** This is an OCI requirement that affects your organizational governance model. Plan for it early with your security and compliance teams.
 - **Volume backup concurrency limits** are per-tenancy per-region. If you're scanning many tenancies in the same region, each gets its own 10-backup limit. But a single tenancy scanning itself is capped at 10.
-- **Connector Hub has eventual consistency.** Don't use it for synchronous coordination. Use it for monitoring and triggering the next phase with tolerance for delay.
+- **Connector Hub has eventual consistency.** Don't use it for synchronous coordination. Use it for monitoring and triggering the next phase with tolerance for short delay.
+- **OCI IAM resources don't support cross-tenancy access.** If you need to enumerate IAM users, groups, or policies in a target tenancy, you'll need a dedicated user in that tenancy. Our platform focuses on compute/volume scanning where cross-tenancy federation works natively.
 
 ## Getting Started
 
 The full platform is open source. See the [README](../README.md) for deployment instructions, project structure, and configuration details.
 
-The scanning infrastructure is self-contained and deployable today. The qflow orchestrator is a separate component with a well-defined API contract, ready to be implemented as a simple script, a containerized service, or a full workflow engine depending on your needs.
+The scanning infrastructure is self-contained and deployable today. The qflow orchestrator is a separate component with a well-defined API contract, ready to be implemented as a simple script, a containerized service, or a full workflow engine depending on your needs. The functions are independently invocable and idempotent, so you can drive the entire workflow from a shell script while building out the full orchestration layer.
